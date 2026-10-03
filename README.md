@@ -6,7 +6,7 @@ The project is designed around a single watering start time. On selected week da
 
 IT does not have a rain sensor,  it does not have all kinds of fancy features.  You are more than welcome to add those, and if you want to be nice submit a patch, after review I'll add it.   
 
-![main](.\png\main.png)
+![main](\png\main.png)
 
 ## Hardware
 
@@ -26,7 +26,7 @@ The current pin mapping targets the RobotDyn ESP32R4 4-relay board and is compil
 
 If another ESP32 relay board is used, update the relay and button pin arrays near the top of the sketch before compiling.    Some things to note.   I am using the base controller.  so there is NO RTC meaning it needs internet to be accurate in any way. it also will lose the time and date completely on power loss.  if you want more accuracy you may want to add an RTC board to the spi interface inside.   I was contemplating adding a temperature sensor to do a freezing inhibit, but I rarely get that here so I'm skippping it for now.
 
-Something to think of,  Sprinkler irrigation valves spike hard  during field collapse, not a bad idea to put an external RC snubber to protect the relays.  Also remember your sprinkler wires are long antennas  they will gleefully suck up lighting strike energy.  a snubber can help with this a little bit, an MOV will help more.   or do what I did,  buy 3 of these boards and replace the board when lightning takes it out.![robotdyn_ESP32R4](.\png\robotdyn_ESP32R4.webp)
+Something to think of,  Sprinkler irrigation valves spike hard  during field collapse, not a bad idea to put an external RC snubber to protect the relays.  Also remember your sprinkler wires are long antennas  they will gleefully suck up lighting strike energy.  a snubber can help with this a little bit, an MOV will help more.   or do what I did,  buy 3 of these boards and replace the board when lightning takes it out.![robotdyn_ESP32R4](\png\robotdyn_ESP32R4.webp)
 
 ## Main Features
 
