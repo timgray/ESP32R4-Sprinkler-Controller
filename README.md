@@ -54,8 +54,6 @@ The fallback AP password can be changed from the Network / Firmware page. The AP
 
 Once the ESP32 has synchronized its clock, temporary WiFi loss does not stop the controller from running the watering schedule. The clock continues running locally. Du understand that the ESP32 software clock with no temp stabilization will drift horribly.  30 seconds per day is not out of the ordinary.
 
-The board does not contain a battery-backed real-time clock. After a complete power loss, if the ESP32 boots with no network connection available, it cannot know the actual date and time. Manual control and the fallback access point still work, but scheduled watering waits until valid time is obtained from an NTP server.
-
 A battery-backed RTC can be added later if completely network-independent scheduled operation after a power failure is required. a DS3231 board would be the easiest.  Oh yeah,  timezones in web interface are American only.  Sorry if this offends you, Oh look sourcecode, you could fix that!
 
 ## Arduino IDE Setup
