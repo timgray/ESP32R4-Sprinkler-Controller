@@ -129,7 +129,7 @@ The red Stop Sprinkler control is an immediate stop. It turns off all zones and 
 
 ## 24 Hour Inhibit
 
-The web interface can inhibit watering for 24 hours. The inhibit expiration time is stored in NVS so it survives a restart. The inhibit can also be released manually before the 24 hours has elapsed.  Why have this?   I see it's raining,  I push button and it doesnt sprinkle.  it's a poor persons rain sensor.  most sprinklers have this.
+The web interface can inhibit watering for 24 hours. The inhibit expiration time is stored in NVS so it survives a restart. The inhibit can also be released manually before the 24 hours has elapsed.  Why have this?   I see it's raining,  I push button and it doesnt sprinkle.  it's a poor persons rain sensor.  most sprinklers have this, well they have the 24 hour inhibit, they dont have a poor person.   
 
 ## License
 
