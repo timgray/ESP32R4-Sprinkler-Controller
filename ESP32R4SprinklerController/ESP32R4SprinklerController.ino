@@ -14,7 +14,8 @@
  * - One watering start time and one set of watering days
  * - Four independently enabled zones with individual run times
  * - Zones run sequentially with a 10 second pressure stabilization gap
- * - SNTP clock
+ * - DS3231 battery-backed real-time clock
+ * - Daily SNTP calibration of the ESP32 clock and DS3231
  * - 24-hour watering inhibit
  * - Manual zone buttons with release cooldown
  * - Saved WiFi configuration with automatic access-point fallback
@@ -28,7 +29,10 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <Wire.h>
 #include <time.h>
+#include <sys/time.h>
+#include <esp_sntp.h>
 
 // -------------------------------------------------
 // NETWORK DEFAULTS
@@ -40,7 +44,7 @@ const char* DEFAULT_WIFI_PASSWORD = "";
 const char* AP_SSID = "SprinklerController";
 const char* DEFAULT_AP_PASSWORD = "sprinkler123";
 
-const char* FIRMWARE_VERSION = "1.1.1";
+const char* FIRMWARE_VERSION = "1.2.0";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 60000;
@@ -56,6 +60,28 @@ const int STATUS_LED     = 2;
 
 const unsigned long RELEASE_COOLDOWN_MS = 300;
 const unsigned long ZONE_GAP_MS = 10000;
+
+// -------------------------------------------------
+// DS3231 REAL-TIME CLOCK
+// -------------------------------------------------
+// The DS3231 stores UTC. Timezone and daylight-saving conversion are handled
+// by the ESP32 so changing the web timezone never requires rewriting the RTC.
+const uint8_t DS3231_ADDRESS = 0x68;
+const int I2C_SDA_PIN = 21;
+const int I2C_SCL_PIN = 22;
+
+const unsigned long RTC_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
+const long RTC_CORRECTION_THRESHOLD_SECONDS = 2;
+const uint32_t NTP_SYNC_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL;
+const uint32_t NTP_FALLBACK_INTERVAL_MS = 60UL * 60UL * 1000UL;
+
+bool rtcConnected = false;
+bool rtcTimeValid = false;
+volatile bool ntpSyncPending = false;
+time_t lastNtpSync = 0;
+time_t lastRtcCorrection = 0;
+unsigned long lastRtcCheckAt = 0;
+String clockSource = "Unknown";
 
 // -------------------------------------------------
 // ZONE SETTINGS
@@ -131,6 +157,13 @@ unsigned long wifiDisconnectedAt = 0;
 void loadSettings();
 void saveSettings();
 void applyTimezone();
+void configureNtp();
+void initializeRTC();
+void handleClockMaintenance();
+void onNtpTimeSync(struct timeval* tv);
+bool readRtcTime(time_t& rtcTime);
+bool writeRtcTime(time_t utcTime);
+String getRtcStatusText();
 void connectWiFi();
 void startFallbackAP();
 void handleNetwork();
@@ -180,8 +213,13 @@ void setup() {
 
   loadSettings();
 
+  // Bring up the battery-backed clock before networking. This lets the
+  // sprinkler know the real date and time even when the router is unavailable.
+  initializeRTC();
+
   connectWiFi();
   applyTimezone();
+  configureNtp();
 
   server.on("/",        HTTP_GET,  handleRoot);
   server.on("/config",  HTTP_GET,  handleConfig);
@@ -207,6 +245,7 @@ void setup() {
 void loop() {
   server.handleClient();
   handleNetwork();
+  handleClockMaintenance();
   handleStatusLED();
   handleButtons();
   handleSchedules();
@@ -368,6 +407,11 @@ void handleNetwork() {
     if (previousStatus != WL_CONNECTED) {
       Serial.print("WiFi connected. IP: ");
       Serial.println(WiFi.localIP());
+
+      // A restored network connection is a good reason to calibrate now rather
+      // than waiting for the next 24-hour NTP poll. Regular polling remains
+      // once per day while the network is healthy.
+      sntp_restart();
     }
 
     if (apFallbackActive) {
@@ -413,7 +457,29 @@ void applyTimezone() {
   Serial.print("  Rule: ");
   Serial.println(timezoneRule);
 
-  configTzTime(timezoneRule.c_str(), "pool.ntp.org", "time.nist.gov");
+  // The RTC always remains in UTC. This rule only changes how the ESP32
+  // presents local time to the scheduler and web interface.
+  setenv("TZ", timezoneRule.c_str(), 1);
+  tzset();
+}
+
+void configureNtp() {
+  // The first SNTP sync is attempted normally at startup. After that, a
+  // healthy DS3231 lets us reduce network clock traffic to once per day.
+  sntp_set_time_sync_notification_cb(onNtpTimeSync);
+
+  if (rtcConnected) {
+    sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
+    Serial.println("NTP calibration interval: 24 hours.");
+  } else {
+    // If the RTC is missing, retain a more conservative network sync interval.
+    sntp_set_sync_interval(NTP_FALLBACK_INTERVAL_MS);
+    Serial.println("RTC unavailable. NTP interval set to 1 hour.");
+  }
+
+  // Set the interval before starting SNTP so the polling service begins with
+  // the interval we actually want rather than its default interval.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
 
 void setTimezoneFromWeb(const String& selected) {
@@ -442,6 +508,298 @@ void setTimezoneFromWeb(const String& selected) {
     timezoneName = "UTC";
     timezoneRule = "UTC0";
   }
+}
+
+// -------------------------------------------------
+// DS3231 / CLOCK MAINTENANCE
+// -------------------------------------------------
+uint8_t bcdToDec(uint8_t value) {
+  return ((value >> 4) * 10) + (value & 0x0F);
+}
+
+uint8_t decToBcd(uint8_t value) {
+  return ((value / 10) << 4) | (value % 10);
+}
+
+bool readRtcRegister(uint8_t reg, uint8_t& value) {
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom((int)DS3231_ADDRESS, 1) != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool writeRtcRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+long long daysFromCivil(int year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yearOfEra = (unsigned)(year - era * 400);
+  const unsigned dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const unsigned dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+  return (long long)era * 146097LL + (long long)dayOfEra - 719468LL;
+}
+
+time_t utcPartsToEpoch(int year, int month, int day, int hour, int minute, int second) {
+  long long days = daysFromCivil(year, (unsigned)month, (unsigned)day);
+  long long seconds = days * 86400LL +
+                      (long long)hour * 3600LL +
+                      (long long)minute * 60LL +
+                      second;
+  return (time_t)seconds;
+}
+
+void initializeRTC() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  rtcConnected = Wire.endTransmission() == 0;
+
+  if (!rtcConnected) {
+    rtcTimeValid = false;
+    Serial.println("DS3231: Not found on I2C.");
+    return;
+  }
+
+  Serial.println("DS3231: Connected.");
+
+  // Make sure the oscillator continues running from the backup battery when
+  // main power is removed. We preserve every other control-register bit.
+  uint8_t control = 0;
+  if (readRtcRegister(0x0E, control)) {
+    control &= 0x7F;
+    writeRtcRegister(0x0E, control);
+  }
+
+  time_t rtcTime = 0;
+  if (!readRtcTime(rtcTime)) {
+    Serial.println("DS3231: Clock is present, but its time is not valid yet.");
+    return;
+  }
+
+  struct timeval tv;
+  tv.tv_sec = rtcTime;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+
+  rtcTimeValid = true;
+  clockSource = "DS3231";
+  lastRtcCorrection = rtcTime;
+
+  Serial.printf("System clock restored from DS3231 UTC: %lld\n", (long long)rtcTime);
+}
+
+bool readRtcTime(time_t& rtcTime) {
+  if (!rtcConnected) {
+    return false;
+  }
+
+  // Bit 7 of the DS3231 status register is OSF. If it is set, the oscillator
+  // has stopped at some point and the calendar cannot be trusted yet.
+  uint8_t status = 0;
+  if (!readRtcRegister(0x0F, status)) {
+    return false;
+  }
+
+  if ((status & 0x80) != 0) {
+    rtcTimeValid = false;
+    return false;
+  }
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom((int)DS3231_ADDRESS, 7) != 7) {
+    return false;
+  }
+
+  uint8_t rawSecond = Wire.read();
+  uint8_t rawMinute = Wire.read();
+  uint8_t rawHour = Wire.read();
+  Wire.read(); // Day-of-week register is not needed here.
+  uint8_t rawDay = Wire.read();
+  uint8_t rawMonth = Wire.read();
+  uint8_t rawYear = Wire.read();
+
+  int second = bcdToDec(rawSecond & 0x7F);
+  int minute = bcdToDec(rawMinute & 0x7F);
+  int hour;
+
+  if ((rawHour & 0x40) != 0) {
+    // The chip can be configured for 12-hour mode. Accept it even though we
+    // always write the clock back in 24-hour mode.
+    hour = bcdToDec(rawHour & 0x1F);
+    bool pm = (rawHour & 0x20) != 0;
+    if (hour == 12) {
+      hour = 0;
+    }
+    if (pm) {
+      hour += 12;
+    }
+  } else {
+    hour = bcdToDec(rawHour & 0x3F);
+  }
+
+  int day = bcdToDec(rawDay & 0x3F);
+  int month = bcdToDec(rawMonth & 0x1F);
+  int year = 2000 + bcdToDec(rawYear);
+  if ((rawMonth & 0x80) != 0) {
+    year += 100;
+  }
+
+  if (second > 59 || minute > 59 || hour > 23 ||
+      day < 1 || day > 31 || month < 1 || month > 12) {
+    rtcTimeValid = false;
+    return false;
+  }
+
+  rtcTime = utcPartsToEpoch(year, month, day, hour, minute, second);
+  if (rtcTime < 946684800) { // January 1, 2000 UTC
+    rtcTimeValid = false;
+    return false;
+  }
+
+  rtcTimeValid = true;
+  return true;
+}
+
+bool writeRtcTime(time_t utcTime) {
+  if (!rtcConnected || utcTime < 946684800) {
+    return false;
+  }
+
+  struct tm utc;
+  gmtime_r(&utcTime, &utc);
+
+  int fullYear = utc.tm_year + 1900;
+  uint8_t month = decToBcd((uint8_t)(utc.tm_mon + 1));
+  if (fullYear >= 2100) {
+    month |= 0x80;
+  }
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write((uint8_t)0x00);
+  Wire.write(decToBcd((uint8_t)utc.tm_sec));
+  Wire.write(decToBcd((uint8_t)utc.tm_min));
+  Wire.write(decToBcd((uint8_t)utc.tm_hour));
+  Wire.write(decToBcd((uint8_t)(utc.tm_wday + 1)));
+  Wire.write(decToBcd((uint8_t)utc.tm_mday));
+  Wire.write(month);
+  Wire.write(decToBcd((uint8_t)(fullYear % 100)));
+
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  // Clear OSF now that we have intentionally written a known-good time.
+  uint8_t status = 0;
+  if (readRtcRegister(0x0F, status)) {
+    status &= 0x7F;
+    writeRtcRegister(0x0F, status);
+  }
+
+  rtcTimeValid = true;
+  return true;
+}
+
+void onNtpTimeSync(struct timeval* tv) {
+  // This callback runs from the SNTP service. Do not perform I2C work here.
+  // The main loop notices the flag and writes the corrected time to the RTC.
+  ntpSyncPending = true;
+}
+
+void handleClockMaintenance() {
+  if (ntpSyncPending) {
+    ntpSyncPending = false;
+
+    time_t now = time(nullptr);
+    if (now >= 100000) {
+      lastNtpSync = now;
+      clockSource = "NTP";
+
+      if (rtcConnected && writeRtcTime(now)) {
+        Serial.println("NTP synchronized. DS3231 updated with corrected UTC time.");
+      } else if (rtcConnected) {
+        Serial.println("WARNING: NTP synchronized, but DS3231 update failed.");
+      } else {
+        Serial.println("NTP synchronized. DS3231 is not connected.");
+      }
+    }
+  }
+
+  if (!rtcConnected) {
+    return;
+  }
+
+  if (millis() - lastRtcCheckAt < RTC_CHECK_INTERVAL_MS) {
+    return;
+  }
+  lastRtcCheckAt = millis();
+
+  time_t rtcTime = 0;
+  if (!readRtcTime(rtcTime)) {
+    Serial.println("WARNING: Could not read a valid time from DS3231.");
+    return;
+  }
+
+  time_t systemTime = time(nullptr);
+  if (systemTime < 100000) {
+    struct timeval tv;
+    tv.tv_sec = rtcTime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    clockSource = "DS3231";
+    lastRtcCorrection = rtcTime;
+    Serial.println("System clock restored from DS3231.");
+    return;
+  }
+
+  long long difference = (long long)rtcTime - (long long)systemTime;
+  long long absoluteDifference = difference < 0 ? -difference : difference;
+
+  if (absoluteDifference > RTC_CORRECTION_THRESHOLD_SECONDS) {
+    struct timeval tv;
+    tv.tv_sec = rtcTime;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    clockSource = "DS3231";
+    lastRtcCorrection = rtcTime;
+
+    Serial.printf(
+      "System clock corrected from DS3231. Difference was %lld second%s.\n",
+      difference,
+      absoluteDifference == 1 ? "" : "s"
+    );
+  }
+}
+
+String getRtcStatusText() {
+  if (!rtcConnected) {
+    return "Not Found";
+  }
+
+  time_t rtcTime = 0;
+  if (!readRtcTime(rtcTime)) {
+    return "Connected - Time Invalid";
+  }
+
+  return "Connected";
 }
 
 // -------------------------------------------------
@@ -734,7 +1092,7 @@ void handleInhibitExpiry() {
 // -------------------------------------------------
 String formatTime(time_t ts) {
   if (ts < 100000) {
-    return "Waiting for network time...";
+    return "Waiting for valid time...";
   }
 
   char buf[32];
@@ -758,7 +1116,7 @@ String formatCountdown(unsigned long remainingMs) {
 
 String formatNextScheduledStart(time_t now) {
   if (now < 100000) {
-    return "Waiting for network time...";
+    return "Waiting for valid time...";
   }
 
   bool anyDaySelected = false;
@@ -899,7 +1257,7 @@ String htmlHead(const char* title) {
 void handleRoot() {
   time_t now = time(nullptr);
 
-  // Restore persisted inhibit state after SNTP becomes available.
+  // Restore persisted inhibit state after any valid clock source becomes available.
   if (now >= 100000 && inhibitUntil > now) {
     inhibitActive = true;
   } else if (now >= 100000 && inhibitUntil != 0 && inhibitUntil <= now) {
@@ -1141,6 +1499,9 @@ void handleStatus() {
   json += "\"networkConnected\":" + String(networkConnected ? "true" : "false") + ",";
   json += "\"networkStatus\":\"" + networkStatus + "\",";
   json += "\"networkInfo\":\"" + networkInfo + "\",";
+  json += "\"rtcConnected\":" + String(rtcConnected ? "true" : "false") + ",";
+  json += "\"rtcValid\":" + String(rtcTimeValid ? "true" : "false") + ",";
+  json += "\"clockSource\":\"" + clockSource + "\",";
 
   int manualActiveZone = -1;
   for (int i = 0; i < NUM_ZONES; i++) {
@@ -1224,7 +1585,7 @@ void handleInhibit() {
 
   time_t now = time(nullptr);
   if (now < 100000) {
-    server.send(500, "text/plain", "Time has not synchronized yet. Try again shortly.");
+    server.send(500, "text/plain", "Time is not valid yet. Try again shortly.");
     return;
   }
 
@@ -1339,6 +1700,28 @@ void handleNetworkPage() {
   html += "<button type='submit' class='btn btn-primary'>Save Network Settings</button>";
   html += "<a href='/' class='btn btn-secondary'>Cancel</a>";
   html += "</form>";
+
+  html += "<div class='card'><h2>Real-Time Clock</h2>";
+  if (rtcConnected) {
+    time_t rtcDisplayTime = 0;
+    if (readRtcTime(rtcDisplayTime)) {
+      html += "<div class='metric'><span class='pill pill-on'>DS3231 CONNECTED</span></div>";
+      html += "<p class='muted'>RTC Time: " + formatTime(rtcDisplayTime) + "<br>Clock Source: " + clockSource + "</p>";
+    } else {
+      html += "<div class='metric'><span class='pill pill-danger'>DS3231 TIME INVALID</span></div>";
+      html += "<p class='muted'>The RTC is connected but does not yet contain trusted time. A successful NTP sync will set it automatically.</p>";
+    }
+  } else {
+    html += "<div class='metric'><span class='pill pill-danger'>DS3231 NOT FOUND</span></div>";
+    html += "<p class='muted'>The controller will continue using network time when available.</p>";
+  }
+
+  if (lastNtpSync > 0) {
+    html += "<p class='muted'>Last NTP Sync: " + formatTime(lastNtpSync) + "</p>";
+  } else {
+    html += "<p class='muted'>Last NTP Sync: Waiting for first synchronization</p>";
+  }
+  html += "</div>";
 
   html += "<div class='card card-soft'><h2>Firmware</h2>";
   html += "<div class='metric'>Version " + String(FIRMWARE_VERSION) + "</div>";

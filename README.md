@@ -24,7 +24,7 @@ The current pin mapping targets the RobotDyn ESP32R4 4-relay board and is compil
 | Zone 4 button | 39 |
 | Status LED | 2 |
 
-If another ESP32 relay board is used, update the relay and button pin arrays near the top of the sketch before compiling.    Some things to note.   I am using the base controller.  so there is NO RTC meaning it needs internet to be accurate in any way. it also will lose the time and date completely on power loss.  if you want more accuracy you may want to add an RTC board to the spi interface inside.   I was contemplating adding a temperature sensor to do a freezing inhibit, but I rarely get that here so I'm skippping it for now.
+If another ESP32 relay board is used, update the relay and button pin arrays near the top of the sketch before compiling. The controller will run fine without an RTC, but it now optionally supports a DS3231 on the I2C bus. I was contemplating adding a temperature sensor to do a freezing inhibit, but I rarely get that here so I'm skippping it for now.
 
 Something to think of,  Sprinkler irrigation valves spike hard  during field collapse, not a bad idea to put an external RC snubber or 30V MOV to protect the relays.  Also remember your sprinkler wires are long antennas  they will gleefully suck up lighting strike energy.  a snubber can help with this a little bit, a second high voltage MOV will help more for that.   or do what I did,  buy 3 of these boards and replace the board when lightning takes it out. you can get away without a snubber or 30V mov for a short time.  Just buy and install them.
 
@@ -54,15 +54,30 @@ The fallback AP password can be changed from the Network / Firmware page. The AP
 
 ## Time and Offline Operation
 
-Once the ESP32 has synchronized its clock, temporary WiFi loss does not stop the controller from running the watering schedule. The clock continues running locally. Du understand that the ESP32 software clock with no temp stabilization will drift horribly.  30 seconds per day is not out of the ordinary.
+The controller supports an optional DS3231 battery-backed real-time clock on the I2C bus. You do not need one for the controller to work. If no DS3231 is detected at startup, the controller simply falls back to normal NTP timekeeping and synchronizes from the network more often.
 
-A battery-backed RTC can be added later if completely network-independent scheduled operation after a power failure is required. a DS3231 board would be the easiest.  Oh yeah,  timezones in web interface are American only.  Sorry if this offends you, Oh look sourcecode, you could fix that!
+If a DS3231 is detected, the behavior changes. The RTC is treated as the local hardware time reference and stores UTC, while the ESP32 still handles the selected timezone and daylight saving rules in software. On startup the ESP32 reads the DS3231 immediately, so after a power failure it can recover the correct date and time without waiting for WiFi or internet access.
+
+While running with a DS3231, the ESP32 compares its software clock to the RTC every 15 minutes. If the two differ by more than a couple of seconds, the ESP32 corrects its clock from the DS3231. NTP is then backed off to approximately once every 24 hours instead of being the primary time source. When an NTP synchronization succeeds, the corrected UTC time is written back to the DS3231 so the RTC stays calibrated over the long term.
+
+If the DS3231 is not installed or cannot be detected, none of this prevents the controller from operating. RTC reads and writes are skipped and NTP synchronization falls back to approximately once per hour. The only limitation is the normal ESP32 limitation: after a complete power loss with no RTC and no network available, the controller does not know the correct date and time until it can reach NTP again. Manual control and the fallback access point still work.
+
+The DS3231 uses the normal ESP32 I2C pins:
+
+| DS3231 | ESP32 |
+| --- | --- |
+| VCC | 3.3V |
+| GND | GND |
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
+
+The Network / Firmware page reports whether the DS3231 was detected and shows the current clock source and RTC status. Oh yeah, timezones in the web interface are American only plus UTC. Sorry if this offends you, Oh look sourcecode, you could fix that!
 
 ## Arduino IDE Setup
 
 Open `ESP32R4SprinklerController.ino` in Arduino IDE and select an ESP32 board configuration appropriate for the RobotDyn ESP32R4. The current project just uses `ESP32 Dev Module`.
 
-The sketch uses libraries supplied by the ESP32 Arduino core: `WiFi`, `WebServer`, `Preferences`, `Update`, and the standard time support. No third-party library is required for the current firmware.
+The sketch uses libraries supplied by the ESP32 Arduino core: `WiFi`, `WebServer`, `Preferences`, `Update`, `Wire`, and the standard time support. No third-party library is required for the current firmware. The optional DS3231 support talks to the RTC directly over I2C, so there is no RTC library to go hunting for either.
 
 Choose an ESP32 partition scheme that supports OTA updates. OTA requires space for two application images. A single-application partition layout cannot perform web OTA updates. I am using Default 4MB with spiffs (1.2MB APP / 1.5MB SPIFFS)
 
