@@ -30,6 +30,16 @@ Something to think of,  Sprinkler irrigation valves spike hard  during field col
 
 ![robotdyn_ESP32R4](/png/robotdyn_ESP32R4.webp)
 
+
+
+
+
+![0](/png/0.jpg)
+
+
+
+
+
 ## Main Features
 
 The controller stores its schedule, zone settings, timezone, inhibit state, WiFi configuration, and access point password in ESP32 NVS flash, so normal settings survive a power loss and firmware update.
